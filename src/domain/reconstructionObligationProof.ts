@@ -19,6 +19,7 @@ export const reconstructionObligationProofSchema = z.strictObject({
             fixture_id: stableIdSchema,
             case_kind: obligationCaseKindSchema,
             passed: z.boolean(),
+            fixture_sha256: digestSchema.exactOptional(),
           }),
         ),
         verifiers: z.array(

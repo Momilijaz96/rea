@@ -2,10 +2,17 @@ import { describe, expect, it } from "vitest";
 
 import { RECONSTRUCTION_READINESS_EXAMPLE } from "./reconstructionReadinessExample.js";
 import { createReconstructionReadinessReport } from "./reconstructionReadiness.js";
+import { createEvidenceBundle } from "../../../../src/domain/evidenceBundle.js";
 import {
+  build,
+  fixtureControlRequest,
+} from "../../../../src/application/ReconstructionObligationLedger.fixture.js";
+import {
+  reconstructionObligationDependencyGraph,
   reconstructionObligationLedgerClosureDigest,
   reconstructionObligationLedgerStatus,
   reconstructionObligationOwnershipGraph,
+  reconstructionObligationReports,
   summarizeReconstructionObligations,
 } from "../../../../src/domain/reconstructionObligationLedgerIntegrity.js";
 import { reconstructionObligationLedgerSchema } from "../../../../src/domain/reconstructionObligationLedgerSchemas.js";
@@ -97,6 +104,103 @@ describe("reconstruction readiness report", () => {
 });
 
 describe("readiness obligation ledger integrity", () => {
+  it("rechecks a fixture control on an indirect optional dependency of a required obligation", () => {
+    const value = input();
+    const fixtureInput = fixtureControlRequest("3".repeat(64), "4".repeat(64));
+    const validOptional = build(fixtureInput);
+    const sourceObligation = validOptional.obligations[0];
+    const required = value.obligation_ledger.obligations[0];
+    const sourceBinding = sourceObligation?.binding;
+    const optionalVerifier = sourceBinding?.verifier;
+    if (
+      sourceObligation === undefined ||
+      sourceBinding === null ||
+      sourceBinding === undefined ||
+      optionalVerifier === null ||
+      optionalVerifier === undefined ||
+      required === undefined ||
+      required.binding === null
+    )
+      throw new Error("Expected bound obligations");
+    const controls = optionalVerifier.controls;
+    if (controls === undefined || controls.length !== 1)
+      throw new Error("Expected one fixture control");
+    const copiedControl = {
+      ...sourceObligation,
+      required: false,
+      binding: {
+        ...sourceBinding,
+        verifier: {
+          ...optionalVerifier,
+          controls: controls.map((control) => ({
+            ...control,
+            candidate_sha256: "3".repeat(64),
+          })),
+        },
+      },
+    };
+    const intermediateId = "obl.optional.intermediate";
+    const intermediate = {
+      ...required,
+      obligation_id: intermediateId,
+      required: false,
+      dependency_obligation_ids: [copiedControl.obligation_id],
+      binding: { ...required.binding, obligation_id: intermediateId },
+    };
+    const obligations = [
+      { ...required, dependency_obligation_ids: [intermediateId] },
+      intermediate,
+      copiedControl,
+    ];
+    const facts = {
+      ...value.obligation_ledger,
+      status: reconstructionObligationLedgerStatus(obligations, []),
+      summary: summarizeReconstructionObligations(obligations),
+      reports: reconstructionObligationReports(obligations),
+      ownership_graph: reconstructionObligationOwnershipGraph(obligations),
+      dependency_graph: reconstructionObligationDependencyGraph(obligations),
+      obligations,
+      evidence_links: [
+        ...new Set([
+          ...value.obligation_ledger.evidence_links,
+          ...validOptional.evidence_links,
+        ]),
+      ].sort(),
+    };
+    const ledger = {
+      ...facts,
+      closure_digest: reconstructionObligationLedgerClosureDigest(facts),
+    };
+    expect(ledger.status).toBe("ready");
+    value.obligation_ledger = ledger;
+    value.evidence_bundle = createEvidenceBundle([
+      ...value.evidence_bundle.records,
+      ...fixtureInput.evidence_bundle.records,
+    ]);
+    const last = value.closure_history.at(-1);
+    if (last === undefined) throw new Error("Expected closure history");
+    last.ledger_digest = ledger.closure_digest;
+
+    const report = createReconstructionReadinessReport(value);
+    expect(report.findings.map(({ code }) => code)).toContain(
+      "fixture-control-content-invalid",
+    );
+    expect(report.status).not.toBe("pass");
+    const missingControlId = controls[0]?.result_evidence_id;
+    if (missingControlId === undefined)
+      throw new Error("Expected control Evidence ID");
+    value.evidence_bundle = createEvidenceBundle(
+      value.evidence_bundle.records.filter(
+        ({ evidence_id: id }) => id !== missingControlId,
+      ),
+    );
+    const missingReport = createReconstructionReadinessReport(value);
+    expect(missingReport.status).not.toBe("pass");
+    expect(missingReport.findings.map(({ code }) => code)).not.toContain(
+      "fixture-control-content-invalid",
+    );
+  });
+
   it("rejects a required obligation changed behind the old ledger commitment", () => {
     const value = input();
     expect(

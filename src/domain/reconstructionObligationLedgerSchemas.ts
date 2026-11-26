@@ -129,6 +129,7 @@ const nondeterminismSchema = z.strictObject({
 
 export const verifierNegativeControlSchema = z.strictObject({
   control_id: stableIdSchema,
+  candidate_kind: z.enum(["artifact", "fixture"]).exactOptional(),
   candidate_id: stableIdSchema.exactOptional(),
   candidate_sha256: digestSchema.exactOptional(),
   defect: textSchema,
@@ -354,6 +355,28 @@ export const reconstructionObligationLedgerSchema = z
     limitations: z.array(textSchema),
   })
   .superRefine((ledger, context) => {
+    const obligationIds = ledger.obligations.map(({ obligation_id: id }) => id);
+    if (new Set(obligationIds).size !== obligationIds.length)
+      context.addIssue({
+        code: "custom",
+        path: ["obligations"],
+        message: "Obligation IDs must be unique",
+      });
+    const statusById = new Map(
+      ledger.obligations.map(({ obligation_id: id, status }) => [id, status]),
+    );
+    for (const [index, obligation] of ledger.obligations.entries())
+      if (
+        obligation.status === "verified" &&
+        obligation.dependency_obligation_ids.some(
+          (id) => statusById.get(id) !== "verified",
+        )
+      )
+        context.addIssue({
+          code: "custom",
+          path: ["obligations", index, "dependency_obligation_ids"],
+          message: "Verified obligation depends on an unverified obligation",
+        });
     if (
       ledger.status !==
       reconstructionObligationLedgerStatus(

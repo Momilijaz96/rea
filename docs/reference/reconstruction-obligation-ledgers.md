@@ -425,6 +425,18 @@ positive `owner.owner_sha256`. `candidate_id`, when set, must not repeat a
 positive fixture id. Omitting the digest, reusing the positive owner digest, or
 reusing a positive fixture id is `inapplicable-control-proof` and cannot close
 the obligation.
+For a control that is itself a fixture, set `candidate_kind: "fixture"`, give its
+`candidate_id`, and set `candidate_sha256` to the SHA-256 of the exact consumed
+contents. The passing verifier proof must record `fixture_sha256` for every
+positive fixture. The failing control proof must retain the same implementation
+owner digest and obligation version, identify the control fixture and its content
+digest, and report `passed: false` for the verifier. A missing fingerprint or a
+control with the same contents as any positive fixture is inapplicable even if
+the fixture names differ; it is not evidence of a vacuous verifier. Historical
+readiness rechecks fixture controls on required obligations and every reachable
+dependency. Artifact controls keep the existing candidate-digest behavior when
+`candidate_kind` is omitted or `"artifact"`. Content digests establish recorded
+difference, not that the declared defect is relevant or honestly captured.
 Claims may share a record, but identities or outcomes from different bindings
 are never joined. Fixture, verifier, and negative-control Evidence authority
 must also satisfy the existing authority requirements.

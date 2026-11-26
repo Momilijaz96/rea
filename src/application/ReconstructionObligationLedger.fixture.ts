@@ -150,7 +150,9 @@ export const packagedProcessManifest = (
           mode: "partial-order",
           specification: binding.specification,
         },
-        ...(binding.controls === undefined ? {} : { controls: binding.controls }),
+        ...(binding.controls === undefined
+          ? {}
+          : { controls: binding.controls }),
       },
     },
   ],
@@ -223,6 +225,99 @@ export const readyProcessLedgerRequest =
       }),
     });
   };
+
+export const fixtureControlRequest = (
+  positiveSha256: string | null,
+  controlSha256: string,
+): ReturnType<typeof request> => {
+  const baseline = readyProcessLedgerRequest();
+  const binding = baseline.manifest.bindings[0];
+  const verifier = binding?.verifier;
+  if (binding === undefined || verifier === null || verifier === undefined)
+    throw new Error("Expected a verifier binding");
+  const controls = verifier.controls;
+  if (controls === undefined || controls.length !== 1)
+    throw new Error("Expected one baseline negative control");
+  const positiveEvidence = baseline.evidence_bundle.records.find(
+    ({ evidence_id: id }) => id === verifier.result_evidence_id,
+  );
+  if (positiveEvidence === undefined)
+    throw new Error("Expected passing verifier Evidence");
+  const positiveProof = reconstructionObligationProofSchema.parse(
+    positiveEvidence.normalized_result,
+  );
+  const fingerprintedPositive = boundProofEvidence("fingerprinted-positive", {
+    bindings: positiveProof.bindings.map((proofBinding) => ({
+      ...proofBinding,
+      fixtures: proofBinding.fixtures.map((fixture) => ({
+        ...fixture,
+        ...(fixture.case_kind !== "positive" || positiveSha256 === null
+          ? {}
+          : { fixture_sha256: positiveSha256 }),
+      })),
+    })),
+  });
+  const controlProof = boundProofEvidence("fingerprinted-control", {
+    bindings: [
+      {
+        obligation_id: binding.obligation_id,
+        obligation_version: positiveProof.bindings[0]?.obligation_version ?? 1,
+        owner_sha256: binding.owner.owner_sha256,
+        fixtures: [
+          {
+            fixture_id: "renamed.bad.fixture",
+            case_kind: "negative",
+            passed: true,
+            fixture_sha256: controlSha256,
+          },
+        ],
+        verifiers: [
+          {
+            verifier_id: verifier.verifier_id,
+            claim_id: verifier.claim_id,
+            passed: false,
+          },
+        ],
+      },
+    ],
+  });
+  return request(
+    [
+      ...baseline.evidence_bundle.records.filter(
+        ({ evidence_id: id }) =>
+          id !== positiveEvidence.evidence_id &&
+          !controls.some((control) => control.result_evidence_id === id),
+      ),
+      fingerprintedPositive,
+      controlProof,
+    ],
+    {
+      manifest: {
+        ...baseline.manifest,
+        bindings: [
+          {
+            ...binding,
+            fixtures: binding.fixtures.map((fixture) => ({
+              ...fixture,
+              evidence_ids: [fingerprintedPositive.evidence_id],
+            })),
+            verifier: {
+              ...verifier,
+              result_evidence_id: fingerprintedPositive.evidence_id,
+              controls: controls.map((control) => ({
+                ...control,
+                candidate_kind: "fixture" as const,
+                candidate_id: "renamed.bad.fixture",
+                candidate_sha256: controlSha256,
+                result_evidence_id: controlProof.evidence_id,
+              })),
+            },
+          },
+        ],
+      },
+    },
+  );
+};
 
 /** Create a minimal reviewed obligation for ledger closure scenarios. */
 export const reviewedObligation = (

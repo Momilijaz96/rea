@@ -39,6 +39,8 @@ import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 type Diagnostic = ReconstructionObligation["diagnostics"][number];
 type Binding = NonNullable<ReconstructionObligation["binding"]>;
+type Verifier = NonNullable<Binding["verifier"]>;
+type Control = NonNullable<Verifier["controls"]>[number];
 
 const groupByObligation = <T extends { readonly obligation_id: string }>(
   entries: readonly T[],
@@ -452,6 +454,25 @@ const evaluateVerifierControls = (
     return;
   }
   for (const control of verifier.controls) {
+    const controlEvidence = context.evidence.get(control.result_evidence_id);
+    const contentIssue =
+      control.candidate_kind === "fixture" && controlEvidence !== undefined
+        ? fixtureControlContentIssue(
+            candidate,
+            binding,
+            verifier,
+            control,
+            context,
+          )
+        : null;
+    if (contentIssue !== null) {
+      addDiagnostic(
+        diagnostics,
+        "inapplicable-verifier-control-proof",
+        `Verifier negative control ${control.control_id}: ${contentIssue}`,
+      );
+      continue;
+    }
     if (control.status === "pass") {
       addDiagnostic(
         diagnostics,
@@ -465,7 +486,6 @@ const evaluateVerifierControls = (
         `Verifier negative control ${control.control_id} status is ${control.status}; expected fail.`,
       );
     }
-    const controlEvidence = context.evidence.get(control.result_evidence_id);
     if (controlEvidence === undefined) {
       addDiagnostic(
         diagnostics,
@@ -509,7 +529,10 @@ const evaluateVerifierControls = (
         kind: "verifier",
         obligationId: candidate.obligation_id,
         obligationVersion: candidate.obligation_version,
-        ownerSha256: control.candidate_sha256,
+        ownerSha256:
+          control.candidate_kind === "fixture"
+            ? binding.owner.owner_sha256
+            : control.candidate_sha256,
         verifierId: verifier.verifier_id,
         claimId: verifier.claim_id,
         expectedPassed: false,
@@ -534,6 +557,160 @@ const evaluateVerifierControls = (
       }
     }
   }
+};
+
+const fixtureControlContentIssue = (
+  candidate: Pick<
+    ReconstructionObligation,
+    "obligation_id" | "obligation_version"
+  >,
+  binding: Binding,
+  verifier: Verifier,
+  control: Control,
+  context: Pick<EvaluationContext, "proofs">,
+): string | null => {
+  if (
+    control.candidate_id === undefined ||
+    control.candidate_sha256 === undefined
+  )
+    return "a fixture control requires a fixture ID and content SHA-256.";
+  const positiveProof = context.proofs.get(verifier.result_evidence_id);
+  if (positiveProof === undefined || !positiveProof.ok)
+    return "the passing verifier Evidence lacks a valid content-bound proof.";
+  const proofBindings = positiveProof.value.result.bindings.filter(
+    (proofBinding) =>
+      proofBinding.obligation_id === candidate.obligation_id &&
+      proofBinding.obligation_version === candidate.obligation_version &&
+      proofBinding.owner_sha256 === binding.owner.owner_sha256,
+  );
+  if (proofBindings.length === 0)
+    return "the passing verifier proof does not identify this obligation owner and revision.";
+  const fixtures = proofBindings.flatMap(({ fixtures }) =>
+    fixtures.filter(({ case_kind }) => case_kind === "positive"),
+  );
+  if (fixtures.length === 0)
+    return "the passing verifier proof identifies no positive fixtures.";
+  for (const bound of binding.fixtures.filter(
+    ({ case_kind }) => case_kind === "positive",
+  )) {
+    const matching = fixtures.filter(
+      (fixture) =>
+        fixture.fixture_id === bound.fixture_id &&
+        fixture.case_kind === bound.case_kind,
+    );
+    if (
+      matching.length === 0 ||
+      matching.some((fixture) => fixture.fixture_sha256 === undefined)
+    )
+      return `positive fixture ${bound.fixture_id} lacks a content SHA-256 in the passing verifier proof.`;
+  }
+  for (const fixture of fixtures) {
+    if (fixture.fixture_sha256 === undefined)
+      return `positive fixture ${fixture.fixture_id} lacks a content SHA-256 in the passing verifier proof.`;
+    if (fixture.fixture_id === control.candidate_id)
+      return `the control reuses positive fixture ${fixture.fixture_id}.`;
+    if (fixture.fixture_sha256 === control.candidate_sha256)
+      return `the control reuses the contents of positive fixture ${fixture.fixture_id}.`;
+  }
+  const controlProof = context.proofs.get(control.result_evidence_id);
+  if (controlProof === undefined || !controlProof.ok)
+    return "the control result lacks a valid fixture proof.";
+  const controlBindings = controlProof.value.result.bindings.filter(
+    (proofBinding) =>
+      proofBinding.obligation_id === candidate.obligation_id &&
+      proofBinding.obligation_version === candidate.obligation_version &&
+      proofBinding.owner_sha256 === binding.owner.owner_sha256,
+  );
+  const matchingControlFixtures = controlBindings.flatMap(({ fixtures }) =>
+    fixtures.filter(({ fixture_id }) => fixture_id === control.candidate_id),
+  );
+  if (
+    controlBindings.length === 0 ||
+    matchingControlFixtures.length === 0 ||
+    controlBindings.some(
+      ({ fixtures }) =>
+        !fixtures.some(({ fixture_id }) => fixture_id === control.candidate_id),
+    ) ||
+    matchingControlFixtures.some(
+      (fixture) =>
+        fixture.case_kind !== "negative" ||
+        fixture.fixture_sha256 !== control.candidate_sha256 ||
+        !fixture.passed,
+    )
+  )
+    return "the control proof does not bind its fixture ID and content SHA-256 to this owner and revision.";
+  return null;
+};
+
+/** Recheck retained fixture controls behind every required obligation. */
+export const historicalFixtureControlContentIssues = (
+  ledger: ReconstructionObligationLedger,
+  records: readonly Evidence[],
+): {
+  obligationId: string;
+  evidenceIds: string[];
+  reason: string;
+}[] => {
+  const byId = new Map(
+    ledger.obligations.map((obligation) => [
+      obligation.obligation_id,
+      obligation,
+    ]),
+  );
+  const proofs = new Map(
+    records.map((record) => [
+      record.evidence_id,
+      parseReconstructionProofEvidence(record),
+    ]),
+  );
+  const reachable = new Set<string>();
+  const pending = ledger.obligations
+    .filter(({ required }) => required)
+    .map(({ obligation_id: id }) => id);
+  const issues: {
+    obligationId: string;
+    evidenceIds: string[];
+    reason: string;
+  }[] = [];
+  while (pending.length > 0) {
+    const id = pending.pop();
+    if (id === undefined || reachable.has(id)) continue;
+    reachable.add(id);
+    const obligation = byId.get(id);
+    if (obligation === undefined) continue;
+    pending.push(...obligation.dependency_obligation_ids);
+    const binding = obligation.binding;
+    const verifier = binding?.verifier;
+    if (binding === null || verifier === null || verifier === undefined)
+      continue;
+    for (const control of verifier.controls ?? []) {
+      if (control.candidate_kind !== "fixture") continue;
+      // Missing records have their own readiness finding; absence does not
+      // establish an invalid content fingerprint.
+      if (
+        !proofs.has(verifier.result_evidence_id) ||
+        !proofs.has(control.result_evidence_id)
+      )
+        continue;
+      const reason = fixtureControlContentIssue(
+        obligation,
+        binding,
+        verifier,
+        control,
+        { proofs },
+      );
+      if (reason !== null)
+        issues.push({
+          obligationId: id,
+          evidenceIds: [
+            verifier.result_evidence_id,
+            control.result_evidence_id,
+          ],
+          reason,
+        });
+    }
+  }
+  return issues;
 };
 
 const evaluateVerifierControlStatus = (

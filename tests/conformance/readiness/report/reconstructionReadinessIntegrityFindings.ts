@@ -6,6 +6,7 @@ import type {
   ReadinessFinding,
   ReconstructionReadinessInput,
 } from "./reconstructionReadinessSchemas.js";
+import { historicalFixtureControlContentIssues } from "../../../../src/application/ReconstructionObligationLedgerEvaluation.js";
 
 export const readinessIntegrityFindings = (
   input: ReconstructionReadinessInput,
@@ -171,6 +172,19 @@ const closureFindings = (
     input.obligation_ledger.evidence_links,
     evidenceIds,
   );
+  for (const issue of historicalFixtureControlContentIssues(
+    input.obligation_ledger,
+    input.evidence_bundle.records,
+  ))
+    findings.push(
+      finding(
+        "fixture-control-content-invalid",
+        "verify-reconstruction-closure",
+        "unknown",
+        `${issue.obligationId}: ${issue.reason}`,
+        issue.evidenceIds,
+      ),
+    );
   evaluateClosureHistory(input, findings, evidenceIds);
   for (const check of input.delegation_checks) {
     if (check.delegates_to_authority)

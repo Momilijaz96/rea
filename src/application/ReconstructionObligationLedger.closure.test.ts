@@ -5,8 +5,19 @@ import { FINALIZED_PROCESS_CAPTURE_EXAMPLE } from "../domain/process/processCapt
 
 import { createEvidence } from "../domain/evidence.js";
 import { unknownTarget } from "../domain/targetIdentity.js";
+import { reconstructionObligationLedgerSchema } from "../domain/reconstructionObligationLedgerSchemas.js";
+import { reconstructionObligationProofSchema } from "../domain/reconstructionObligationProof.js";
+import {
+  reconstructionObligationDependencyGraph,
+  reconstructionObligationLedgerClosureDigest,
+  reconstructionObligationLedgerStatus,
+  reconstructionObligationOwnershipGraph,
+  reconstructionObligationReports,
+  summarizeReconstructionObligations,
+} from "../domain/reconstructionObligationLedgerIntegrity.js";
 import {
   boundProofEvidence,
+  fixtureControlRequest,
   build,
   deriveCandidates,
   resolveRequest,
@@ -137,6 +148,201 @@ describe("reconstruction obligation ledger", () => {
       ]),
     );
     expect(result.status).toBe("open");
+  });
+});
+
+describe("fixture control content identity (#6367)", () => {
+  const withControlProof = (
+    change: (
+      fixture: ReturnType<
+        typeof reconstructionObligationProofSchema.parse
+      >["bindings"][number]["fixtures"][number],
+    ) => ReturnType<
+      typeof reconstructionObligationProofSchema.parse
+    >["bindings"][number]["fixtures"],
+  ) => {
+    const input = fixtureControlRequest("3".repeat(64), "4".repeat(64));
+    const binding = input.manifest.bindings[0];
+    const verifier = binding?.verifier;
+    const control = verifier?.controls?.[0];
+    if (
+      binding === undefined ||
+      verifier === null ||
+      verifier === undefined ||
+      control === undefined
+    )
+      throw new Error("Expected a control");
+    const evidence = input.evidence_bundle.records.find(
+      ({ evidence_id: id }) => id === control.result_evidence_id,
+    );
+    if (evidence === undefined) throw new Error("Expected control Evidence");
+    const parsed = reconstructionObligationProofSchema.parse(
+      evidence.normalized_result,
+    );
+    const proofBinding = parsed.bindings[0];
+    const fixture = proofBinding?.fixtures[0];
+    if (proofBinding === undefined || fixture === undefined)
+      throw new Error("Expected a control fixture proof");
+    const replacement = boundProofEvidence("altered-control", {
+      bindings: [{ ...proofBinding, fixtures: change(fixture) }],
+    });
+    return request(
+      [
+        ...input.evidence_bundle.records.filter(
+          ({ evidence_id: id }) => id !== evidence.evidence_id,
+        ),
+        replacement,
+      ],
+      {
+        manifest: {
+          ...input.manifest,
+          bindings: [
+            {
+              ...binding,
+              verifier: {
+                ...verifier,
+                controls: [
+                  { ...control, result_evidence_id: replacement.evidence_id },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    );
+  };
+
+  it("keeps a renamed control open when its contents match a positive fixture", () => {
+    const copiedContentsSha256 = "3".repeat(64);
+    const ledger = build(
+      fixtureControlRequest(copiedContentsSha256, copiedContentsSha256),
+    );
+    expect(ledger.status).toBe("open");
+    expect(ledger.obligations[0]?.verifier_control_status).toBe(
+      "inapplicable-control-proof",
+    );
+    expect(
+      ledger.obligations[0]?.diagnostics.map(({ code }) => code),
+    ).toContain("inapplicable-verifier-control-proof");
+  });
+
+  it("accepts a distinct fixture when the same owner and revision prove its rejection", () => {
+    const ledger = build(fixtureControlRequest("3".repeat(64), "4".repeat(64)));
+    expect(ledger.status).toBe("ready");
+    expect(ledger.obligations[0]?.verifier_control_status).toBe("challenged");
+  });
+
+  it("keeps missing control Evidence classified as missing", () => {
+    const input = fixtureControlRequest("3".repeat(64), "4".repeat(64));
+    const controlId =
+      input.manifest.bindings[0]?.verifier?.controls?.[0]?.result_evidence_id;
+    if (controlId === undefined) throw new Error("Expected a control");
+    const ledger = build(
+      request(
+        input.evidence_bundle.records.filter(
+          ({ evidence_id: id }) => id !== controlId,
+        ),
+        { manifest: input.manifest },
+      ),
+    );
+    expect(ledger.obligations[0]?.verifier_control_status).toBe(
+      "missing-control-result",
+    );
+  });
+
+  it("requires content fingerprints for the positive fixtures", () => {
+    const ledger = build(fixtureControlRequest(null, "4".repeat(64)));
+    expect(ledger.status).toBe("open");
+    expect(ledger.obligations[0]?.verifier_control_status).toBe(
+      "inapplicable-control-proof",
+    );
+  });
+
+  it("rejects conflicting outcomes for the same control fixture", () => {
+    const ledger = build(
+      withControlProof((fixture) => [fixture, { ...fixture, passed: false }]),
+    );
+    expect(ledger.status).toBe("open");
+    expect(ledger.obligations[0]?.verifier_control_status).toBe(
+      "inapplicable-control-proof",
+    );
+  });
+
+  it("rejects a control proof that labels its fixture positive", () => {
+    const ledger = build(
+      withControlProof((fixture) => [{ ...fixture, case_kind: "positive" }]),
+    );
+    expect(ledger.status).toBe("open");
+    expect(ledger.obligations[0]?.verifier_control_status).toBe(
+      "inapplicable-control-proof",
+    );
+  });
+});
+
+describe("historical obligation identity (#6367)", () => {
+  it("rejects duplicate obligation IDs before a later entry can shadow proof", () => {
+    const ledger = build(readyProcessLedgerRequest());
+    const obligation = ledger.obligations[0];
+    if (obligation === undefined) throw new Error("Expected an obligation");
+    const parsed = reconstructionObligationLedgerSchema.safeParse({
+      ...ledger,
+      obligations: [obligation, obligation],
+    });
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error("Expected a rejected ledger");
+    expect(parsed.error.issues.map(({ message }) => message)).toContain(
+      "Obligation IDs must be unique",
+    );
+  });
+
+  it("rejects a ready claim whose required obligation depends on an open optional obligation", () => {
+    const base = build(readyProcessLedgerRequest());
+    const original = base.obligations[0];
+    if (original === undefined || original.binding === null)
+      throw new Error("Expected a bound obligation");
+    const optional = {
+      ...original,
+      obligation_id: "obl.optional.dependency",
+      required: false,
+      status: "implemented" as const,
+      diagnostics: [
+        {
+          code: "missing-verifier-control" as const,
+          detail: "The optional dependency has no valid control.",
+        },
+      ],
+      binding: {
+        ...original.binding,
+        obligation_id: "obl.optional.dependency",
+      },
+    };
+    const obligations = [
+      {
+        ...original,
+        dependency_obligation_ids: [optional.obligation_id],
+      },
+      optional,
+    ];
+    const facts = {
+      ...base,
+      status: reconstructionObligationLedgerStatus(obligations, []),
+      summary: summarizeReconstructionObligations(obligations),
+      reports: reconstructionObligationReports(obligations),
+      ownership_graph: reconstructionObligationOwnershipGraph(obligations),
+      dependency_graph: reconstructionObligationDependencyGraph(obligations),
+      obligations,
+    };
+    const historical = {
+      ...facts,
+      closure_digest: reconstructionObligationLedgerClosureDigest(facts),
+    };
+    expect(historical.status).toBe("ready");
+    const parsed = reconstructionObligationLedgerSchema.safeParse(historical);
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error("Expected a rejected ledger");
+    expect(parsed.error.issues.map(({ message }) => message)).toContain(
+      "Verified obligation depends on an unverified obligation",
+    );
   });
 });
 
